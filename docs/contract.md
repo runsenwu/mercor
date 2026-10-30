@@ -1,7 +1,7 @@
 # Interface contract
 
-Every component (API, worker, platform, dashboard, load tests) builds against this file.
-If something here is wrong or missing, change it here first, then in the code.
+Reference for how the components (API, worker, platform, load tests) fit together.
+Defaults live in code (`Options.cs`, `WorkerOptions.cs`); keep this file in sync when they change.
 
 ## Repo layout
 
@@ -13,8 +13,9 @@ src/Shortener.Worker     analytics worker (RabbitMQ consumer -> batched Postgres
 tests/Shortener.Api.Tests, tests/Shortener.Worker.Tests   xUnit v3 tests (Microsoft Testing Platform; `dotnet test`)
 deploy/docker-compose.yml, deploy/nginx/, deploy/postgres/init/ (schema), deploy/otel-collector/,
 deploy/prometheus/, deploy/tempo/, deploy/loki/, deploy/grafana/{provisioning,dashboards}/
-loadtest/                k6 scripts + seed.sql
-Makefile, README.md
+loadtest/                k6 scripts + seed.sql (see loadtest/README.md)
+Makefile
+docs/contract.md        this file
 ```
 
 ## Compose services and ports
