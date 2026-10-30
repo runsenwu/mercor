@@ -4,7 +4,3 @@
 - duplicate the load balancer (to reduce single point of failure)
 - use some type of container orchestrators
 - once we have some levels of traffic 
-
-
-sending to: 
-soumilgad@mercor.com
