@@ -1,0 +1,10 @@
+- staging env / some type of sandbox for testing
+- canary for testing prod
+- performance diagnostic tools (enabling memory dumps and traces in C#)
+- duplicate the load balancer (to reduce single point of failure)
+- use some type of container orchestrators
+- once we have some levels of traffic 
+
+
+sending to: 
+soumilgad@mercor.com

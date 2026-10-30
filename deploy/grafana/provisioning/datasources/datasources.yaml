@@ -1,0 +1,57 @@
+apiVersion: 1
+# `$$` escapes `$` from Grafana's env-var interpolation in provisioning files.
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      httpMethod: POST
+      timeInterval: 5s
+      exemplarTraceIdDestinations:
+        - name: trace_id
+          datasourceUid: tempo
+  - name: Tempo
+    uid: tempo
+    type: tempo
+    access: proxy
+    url: http://tempo:3200
+    editable: false
+    jsonData:
+      tracesToLogsV2:
+        datasourceUid: loki
+        spanStartTimeShift: '-5m'
+        spanEndTimeShift: '5m'
+        tags: [{ key: service.name, value: service_name }]
+        customQuery: true
+        query: '{$${__tags}} | trace_id="$${__trace.traceId}"'
+      tracesToMetrics:
+        datasourceUid: prometheus
+        tags: [{ key: service.name, value: service_name }]
+      serviceMap:
+        datasourceUid: prometheus
+      nodeGraph:
+        enabled: true
+      lokiSearch:
+        datasourceUid: loki
+      streamingEnabled:
+        search: true
+  - name: Loki
+    uid: loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+    editable: false
+    jsonData:
+      maxLines: 1000
+      derivedFields:
+        # OTLP logs carry trace_id as structured metadata, so match it as a label, not with a regex on the line.
+        - name: TraceID
+          matcherType: label
+          matcherRegex: trace_id
+          datasourceUid: tempo
+          url: '$${__value.raw}'
+          urlDisplayLabel: View trace

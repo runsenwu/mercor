@@ -1,0 +1,335 @@
+# Shortener stack. Start with `make up` (or: docker compose -f deploy/docker-compose.yml up -d --build).
+# Every ${VAR:-default} is a knob: set it in the shell (`CACHE_ENABLED=false make up`), in deploy/.env
+# (auto-loaded by compose), or in a root .env (the Makefile passes it). See deploy/.env.example.
+name: shortener
+
+x-logging: &logging
+  driver: json-file
+  options: { max-size: "10m", max-file: "3" }
+
+x-dotnet-env: &dotnet-env
+  ConnectionStrings__RabbitMq: amqp://shortener:shortener@rabbitmq:5672/
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+  OTEL_EXPORTER_OTLP_PROTOCOL: grpc
+  OTEL_METRIC_EXPORT_INTERVAL: "5000"
+  Telemetry__TraceSampleRatio: ${TRACE_SAMPLE_RATIO:-1.0}
+
+services:
+  nginx:
+    image: nginx:1.30.6-alpine
+    # Copy the read-only config so the image's autotune script can set worker_processes from the CPU quota.
+    command: ["sh", "-c", "cp /etc/nginx/shortener/nginx.conf /etc/nginx/nginx.conf && exec /docker-entrypoint.sh nginx -g 'daemon off;'"]
+    environment:
+      NGINX_ENTRYPOINT_WORKER_PROCESSES_AUTOTUNE: "1"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/shortener/nginx.conf:ro
+    ports:
+      - "${NGINX_HOST_PORT:-8080}:80"
+    ulimits:
+      nofile: { soft: 65535, hard: 65535 }
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8081/stub_status"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    depends_on:
+      api: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { cpus: "${NGINX_CPUS:-2}", memory: 256M }
+    restart: unless-stopped
+    logging: *logging
+
+  api:
+    build:
+      context: ..
+      dockerfile: src/Shortener.Api/Dockerfile
+    image: shortener-api:local
+    environment:
+      <<: *dotnet-env
+      ConnectionStrings__Postgres: "Host=postgres;Database=shortener;Username=shortener;Password=shortener;Maximum Pool Size=${API_DB_MAX_POOL_SIZE:-100}"
+      ConnectionStrings__Redis: redis:6379
+      Shortener__PublicBaseUrl: ${PUBLIC_BASE_URL:-http://localhost:8080}
+      Cache__Enabled: ${CACHE_ENABLED:-true}
+      Cache__TtlSeconds: ${CACHE_TTL_SECONDS:-3600}
+      Cache__NegativeTtlSeconds: ${CACHE_NEGATIVE_TTL_SECONDS:-60}
+      Clicks__Mode: ${CLICKS_MODE:-queue}
+      Clicks__BufferCapacity: ${CLICKS_BUFFER_CAPACITY:-10000}
+      RateLimits__AnonymousCreatesPerMinute: ${RATELIMIT_ANON_CREATES_PER_MINUTE:-20}
+      RateLimits__AnonymousReadsPerMinute: ${RATELIMIT_ANON_READS_PER_MINUTE:-300}
+      ApiKeys__0__Name: demo
+      ApiKeys__0__Key: demo-key-change-me
+      ApiKeys__0__PermitsPerMinute: "600"
+      ApiKeys__1__Name: loadtest
+      ApiKeys__1__Key: loadtest-key-change-me
+      ApiKeys__1__PermitsPerMinute: "100000000"
+    # No container_name and no host port: scale with `docker compose up -d --scale api=N` (nginx re-resolves).
+    healthcheck:
+      # The aspnet image has no curl: plain HTTP over bash /dev/tcp.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080 && printf 'GET /readyz HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && head -n 1 <&3 | grep -q ' 200 '"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 30s
+      start_interval: 1s
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+      otel-collector: { condition: service_started }
+    deploy:
+      replicas: ${API_REPLICAS:-2}
+      # Limits make the saturation point reproducible and keep k6 from competing for the same cores.
+      resources:
+        limits: { cpus: "${API_CPUS:-1}", memory: "${API_MEMORY:-512M}" }
+    restart: unless-stopped
+    logging: *logging
+
+  worker:
+    build:
+      context: ..
+      dockerfile: src/Shortener.Worker/Dockerfile
+    image: shortener-worker:local
+    environment:
+      <<: *dotnet-env
+      ConnectionStrings__Postgres: "Host=postgres;Database=shortener;Username=shortener;Password=shortener;Maximum Pool Size=${WORKER_DB_MAX_POOL_SIZE:-100}"
+      Worker__Prefetch: ${WORKER_PREFETCH:-1000}
+      Worker__BatchSize: ${WORKER_BATCH_SIZE:-500}
+      Worker__BatchMaxWaitMs: ${WORKER_BATCH_MAX_WAIT_MS:-1000}
+    stop_grace_period: 25s   # graceful flush of the in-flight batch can take up to 20 s
+    depends_on:
+      postgres: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+      otel-collector: { condition: service_started }
+    deploy:
+      replicas: ${WORKER_REPLICAS:-1}
+      resources:
+        limits: { cpus: "${WORKER_CPUS:-0.5}", memory: "${WORKER_MEMORY:-256M}" }
+    restart: unless-stopped
+    logging: *logging
+
+  postgres:
+    image: postgres:18.6-trixie
+    # Localhost only, for pgAdmin/psql. 5433 because a native WSL Postgres already owns 5432.
+    ports:
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5433}:5432"
+    environment:
+      POSTGRES_USER: shortener
+      POSTGRES_PASSWORD: shortener
+      POSTGRES_DB: shortener
+    command:
+      - postgres
+      - -c
+      - max_connections=${POSTGRES_MAX_CONNECTIONS:-100}   # the default, explicit: we hit it under load
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - shared_buffers=${POSTGRES_SHARED_BUFFERS:-256MB}
+      - -c
+      - track_io_timing=on
+      - -c
+      - log_lock_waits=on
+      - -c
+      - log_min_duration_statement=${POSTGRES_LOG_MIN_DURATION_MS:-500}
+    shm_size: 256m
+    volumes:
+      # Postgres 18 images keep data under /var/lib/postgresql/18/docker, so mount the parent.
+      - postgres-data:/var/lib/postgresql
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U shortener -d shortener"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 30s
+      start_interval: 1s
+    deploy:
+      resources:
+        limits: { cpus: "${POSTGRES_CPUS:-2}", memory: 2G }
+    stop_grace_period: 30s
+    restart: unless-stopped
+    logging: *logging
+
+  redis:
+    image: redis:8.10.3-alpine
+    # Cache only: no RDB/AOF persistence, bounded memory, evict least-recently-used keys.
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "${REDIS_MAXMEMORY:-256mb}", "--maxmemory-policy", "allkeys-lru"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+      start_interval: 1s
+    deploy:
+      resources:
+        limits: { cpus: "${REDIS_CPUS:-1}", memory: 512M }
+    restart: unless-stopped
+    logging: *logging
+
+  rabbitmq:
+    image: rabbitmq:4.3.7-management
+    hostname: rabbitmq   # stable node name, so the data volume is reused across recreates
+    volumes:
+      - ./rabbitmq/rabbitmq.conf:/etc/rabbitmq/conf.d/20-shortener.conf:ro
+      - rabbitmq-data:/var/lib/rabbitmq
+    ports:
+      - "127.0.0.1:15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_port_connectivity"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+      start_interval: 2s
+    deploy:
+      resources:
+        limits: { cpus: "${RABBITMQ_CPUS:-2}", memory: 1G }
+    restart: unless-stopped
+    logging: *logging
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.164.0
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    environment:
+      TAIL_SAMPLING_PERCENT: ${TAIL_SAMPLING_PERCENT:-10}
+    volumes:
+      - ./otel-collector/config.yaml:/etc/otelcol-contrib/config.yaml:ro
+    depends_on: [tempo, loki]
+    deploy:
+      resources:
+        limits: { cpus: "2", memory: 1G }
+    restart: unless-stopped
+    logging: *logging
+
+  prometheus:
+    image: prom/prometheus:v3.15.1
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=${PROMETHEUS_RETENTION:-7d}
+      - --web.enable-remote-write-receiver   # k6 pushes its metrics here
+      - --web.enable-lifecycle
+      - --enable-feature=exemplar-storage
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "127.0.0.1:9090:9090"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9090/-/ready"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    deploy:
+      resources:
+        limits: { memory: 2G }
+    restart: unless-stopped
+    logging: *logging
+
+  tempo:
+    image: grafana/tempo:3.1.1
+    command: ["-config.file=/etc/tempo/tempo.yaml"]
+    volumes:
+      - ./tempo/tempo.yaml:/etc/tempo/tempo.yaml:ro
+      - tempo-data:/var/tempo
+    deploy:
+      resources:
+        limits: { memory: 2G }
+    restart: unless-stopped
+    logging: *logging
+
+  loki:
+    image: grafana/loki:3.7.9
+    command: ["-config.file=/etc/loki/loki.yaml"]
+    volumes:
+      - ./loki/loki.yaml:/etc/loki/loki.yaml:ro
+      - loki-data:/loki
+    deploy:
+      resources:
+        limits: { memory: 1G }
+    restart: unless-stopped
+    logging: *logging
+
+  grafana:
+    image: grafana/grafana:13.2.5
+    environment:
+      # Anonymous admin is fine only because the port is bound to 127.0.0.1.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/dashboards/shortener-overview.json
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/etc/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "127.0.0.1:3000:3000"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3000/api/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    depends_on: [prometheus, tempo, loki]
+    deploy:
+      resources:
+        limits: { memory: 512M }
+    restart: unless-stopped
+    logging: *logging
+
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.20.1
+    command: ["--collector.stat_statements"]
+    environment:
+      DATA_SOURCE_URI: postgres:5432/shortener?sslmode=disable
+      DATA_SOURCE_USER: shortener
+      DATA_SOURCE_PASS: shortener
+    depends_on:
+      postgres: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M }
+    restart: unless-stopped
+    logging: *logging
+
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.96.0
+    environment:
+      REDIS_ADDR: redis://redis:6379
+    depends_on:
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M }
+    restart: unless-stopped
+    logging: *logging
+
+  # Load generator: `make load SCENARIO=ramp` (docker compose --profile loadtest run --rm k6 run ...).
+  k6:
+    image: grafana/k6:2.3.0
+    profiles: [loadtest]
+    user: "${UID:-1000}:${GID:-1000}"   # so k6 can write /scripts/results on the bind mount
+    working_dir: /scripts
+    volumes:
+      - ../loadtest:/scripts
+    environment:
+      BASE_URL: http://nginx
+      API_KEY: loadtest-key-change-me
+      K6_PROMETHEUS_RW_SERVER_URL: http://prometheus:9090/api/v1/write
+      K6_PROMETHEUS_RW_TREND_STATS: p(50),p(95),p(99),max
+      K6_PROMETHEUS_RW_PUSH_INTERVAL: 5s
+    ulimits:
+      nofile: { soft: 65535, hard: 65535 }
+    depends_on: [nginx, prometheus]
+
+volumes:
+  postgres-data:
+  rabbitmq-data:
+  prometheus-data:
+  tempo-data:
+  loki-data:
+  grafana-data:

@@ -1,0 +1,11 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Shortener.Api/Shortener.Api.csproj" />
+    <Project Path="src/Shortener.Shared/Shortener.Shared.csproj" />
+    <Project Path="src/Shortener.Worker/Shortener.Worker.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Shortener.Api.Tests/Shortener.Api.Tests.csproj" />
+    <Project Path="tests/Shortener.Worker.Tests/Shortener.Worker.Tests.csproj" />
+  </Folder>
+</Solution>

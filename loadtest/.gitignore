@@ -1,0 +1,2 @@
+# k6 end-of-test summaries (written by handleSummary)
+results/*.json

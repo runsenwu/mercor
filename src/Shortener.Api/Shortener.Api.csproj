@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <ItemGroup>
+    <ProjectReference Include="..\Shortener.Shared\Shortener.Shared.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Dapper" />
+    <PackageReference Include="Npgsql" />
+    <PackageReference Include="Npgsql.OpenTelemetry" />
+    <PackageReference Include="StackExchange.Redis" />
+    <PackageReference Include="RabbitMQ.Client" />
+    <PackageReference Include="Microsoft.AspNetCore.OpenApi" />
+    <PackageReference Include="Scalar.AspNetCore" />
+    <PackageReference Include="OpenTelemetry.Instrumentation.AspNetCore" />
+    <PackageReference Include="OpenTelemetry.Instrumentation.Http" />
+    <PackageReference Include="OpenTelemetry.Instrumentation.StackExchangeRedis" />
+  </ItemGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="Shortener.Api.Tests" />
+  </ItemGroup>
+</Project>
